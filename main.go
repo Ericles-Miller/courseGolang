@@ -41,6 +41,16 @@ func main() {
 			r.Get("/users", func(w http.ResponseWriter, r *http.Request) {})
 		})
 
+		r.Get("/users/{id}", func(w http.ResponseWriter, r *http.Request) {
+			// chi.URLParam extrai o valor do parâmetro "id" da URL.
+			id := chi.URLParam(r, "id")
+			if id == "" {
+        http.Error(w, "id obrigatório", http.StatusBadRequest)
+        return
+    	}
+			fmt.Fprintf(w, "User ID: %s", id)
+		})
+
 		// Versionamento de API: rotas sob "/api/v2" (ainda sem rotas definidas)
 		r.Route("/v2", func(r chi.Router) {
 		})
