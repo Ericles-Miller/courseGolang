@@ -1,86 +1,104 @@
 package main
 
 import (
-	"fmt"
+	"encoding/json"
 	"net/http"
-	"time"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
+// User representa um usuário do sistema.
+// A tag `json:",string"` faz o ID ser serializado como string no JSON (em vez de número).
+// A tag `json:"-"` omite o campo Password na serialização — nunca expõe a senha.
+type User struct {
+	Username string
+	ID       int64 `json:",string"`
+	Role     string
+	Password string `json:"-"`
+}
+
 func main() {
-	// chi.NewMux cria um novo roteador (multiplexer) do Chi.
-	// É o ponto central onde todas as rotas e middlewares são registrados.
+	// chi.NewMux cria o roteador principal onde rotas e middlewares são registrados.
 	r := chi.NewMux()
 
-	// middleware.Recoverer captura panics em handlers e retorna HTTP 500,
+	// middleware.Recoverer captura panics nos handlers e retorna HTTP 500,
 	// evitando que o servidor caia por erros não tratados.
 	r.Use(middleware.Recoverer)
 
-	// middleware.RequestID injeta um ID único em cada requisição (via header X-Request-Id).
-	// Útil para rastrear logs de uma mesma requisição.
+	// middleware.RequestID injeta um ID único em cada requisição (header X-Request-Id),
+	// útil para rastrear logs de uma mesma requisição.
 	r.Use(middleware.RequestID)
 
-	// middleware.Logger registra no terminal cada requisição recebida com método, rota e duração.
+	// middleware.Logger registra no terminal cada requisição com método, rota e duração.
 	r.Use(middleware.Logger)
 
-	// Rota simples GET que retorna a data/hora atual do servidor.
-	r.Get("/horario", func(w http.ResponseWriter, r *http.Request) {
-		now := time.Now()
-		fmt.Fprintln(w, now)
-	})
+	// db simula um banco de dados em memória: um map onde a chave é o ID do usuário.
+	db := map[int64]User{
+		1: {
+			Username: "admin",
+			Password: "admin",
+			Role:     "admin",
+			ID:       1,
+		},
+	}
 
-	// r.Route agrupa rotas sob um prefixo comum ("/api").
-	// Todas as sub-rotas definidas dentro herdam esse prefixo.
-	r.Route("/api", func(r chi.Router) {
+	// r.Group agrupa rotas sem alterar o prefixo da URL.
+	// Permite aplicar middlewares apenas às rotas dentro do grupo.
+	r.Group(func(r chi.Router) {
+		// jsonMiddleware define Content-Type: application/json para todas as rotas do grupo.
+		r.Use(jsonMiddleware)
 
-		// Versionamento de API: rotas sob "/api/v1"
-		r.Route("/v1", func(r chi.Router) {
-			// GET /api/v1/users — handler vazio, serve como exemplo de estrutura
-			r.Get("/users", func(w http.ResponseWriter, r *http.Request) {})
-		})
+		// GET /users/{id} — busca um usuário pelo ID.
+		// O padrão [0-9]+ garante que apenas números são aceitos como parâmetro.
+		r.Get("/users/{id:[0-9]+}", handleGetUsers(db))
 
-		r.Get("/users/{id}", func(w http.ResponseWriter, r *http.Request) {
-			// chi.URLParam extrai o valor do parâmetro "id" da URL.
-			id := chi.URLParam(r, "id")
-			if id == "" {
-        http.Error(w, "id obrigatório", http.StatusBadRequest)
-        return
-    	}
-			fmt.Fprintf(w, "User ID: %s", id)
-		})
-
-		// Versionamento de API: rotas sob "/api/v2" (ainda sem rotas definidas)
-		r.Route("/v2", func(r chi.Router) {
-		})
-
-		// r.With aplica um middleware pontualmente, apenas para esta rota.
-		// middleware.RealIP lê o IP real do cliente a partir de headers como X-Forwarded-For.
-		// GET /api/users
-		r.With(middleware.RealIP).Get("/users", func(w http.ResponseWriter, r *http.Request) {})
-
-		// r.Group cria um sub-grupo de rotas sem alterar o prefixo da URL.
-		// Permite aplicar middlewares apenas às rotas dentro do grupo.
-		r.Group(func(r chi.Router) {
-			// middleware.BasicAuth protege as rotas do grupo com autenticação HTTP Basic.
-			// O mapa define as credenciais válidas: usuário "admin" com senha "admin".
-			r.Use(middleware.BasicAuth("", map[string]string{
-				"admin": "admin",
-			}))
-
-			// GET /api/healthcheck — retorna "ping" para indicar que o servidor está no ar.
-			// Exige autenticação Basic (definida no grupo acima).
-			r.Get("/healthcheck", func(w http.ResponseWriter, r *http.Request) {
-				fmt.Fprintln(w, "ping")
-			})
-		})
+		// POST /users — cria um novo usuário.
+		r.Post("/users", handlePostUsers)
 	})
 
 	// Inicia o servidor HTTP na porta 8080.
 	// Se houver erro ao subir (ex: porta ocupada), panic encerra o programa imediatamente.
-	fmt.Println("Servidor rodando em http://localhost:8080")
 	if err := http.ListenAndServe(":8080", r); err != nil {
 		panic(err)
 	}
+}
+
+// jsonMiddleware é um middleware que define o header Content-Type como application/json
+// em todas as respostas, antes de chamar o próximo handler da cadeia.
+func jsonMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// handleGetUsers retorna um handler que busca um usuário no db pelo ID da URL.
+// Usa closure para capturar o db, evitando variáveis globais.
+func handleGetUsers(db map[int64]User) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Extrai o parâmetro "id" da URL e converte para int64.
+		idStr := chi.URLParam(r, "id")
+		id, _ := strconv.ParseInt(idStr, 10, 64)
+
+		// Busca o usuário no map; ok será false se o ID não existir.
+		user, ok := db[id]
+
+		if ok {
+			// json.Marshal serializa o struct User para JSON,
+			// respeitando as tags (omite Password, converte ID para string).
+			data, err := json.Marshal(user)
+			if err != nil {
+				panic(err)
+			}
+
+			_, _ = w.Write(data)
+		}
+	}
+}
+
+// handlePostUsers é o handler para criação de usuários — ainda sem implementação.
+func handlePostUsers(w http.ResponseWriter, r *http.Request) {
+
 }
