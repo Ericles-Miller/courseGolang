@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-
+	"errors"
+	"fmt"
+	"io"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -55,7 +57,7 @@ func main() {
 		r.Get("/users/{id:[0-9]+}", handleGetUsers(db))
 
 		// POST /users — cria um novo usuário.
-		r.Post("/users", handlePostUsers)
+		r.Post("/users", handlePostUsers(db))
 	})
 
 	// Inicia o servidor HTTP na porta 8080.
@@ -85,20 +87,62 @@ func handleGetUsers(db map[int64]User) http.HandlerFunc {
 		// Busca o usuário no map; ok será false se o ID não existir.
 		user, ok := db[id]
 
-		if ok {
-			// json.Marshal serializa o struct User para JSON,
-			// respeitando as tags (omite Password, converte ID para string).
-			data, err := json.Marshal(user)
-			if err != nil {
-				panic(err)
-			}
-
-			_, _ = w.Write(data)
+		// Se o usuário não existir no map, retorna 404 com mensagem de erro em JSON.
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error": "usuario nao encontrado"}`))
+			return
 		}
+
+		// Serializa o struct User para JSON. Password é omitido pela tag `json:"-"`.
+		data, err := json.Marshal(user)
+
+		if err != nil {
+			http.Error(w, "something went wrong", http.StatusInternalServerError)
+			return
+		}
+
+		_, _ = w.Write(data)
 	}
 }
 
-// handlePostUsers é o handler para criação de usuários — ainda sem implementação.
-func handlePostUsers(w http.ResponseWriter, r *http.Request) {
+// handlePostUsers retorna um handler que cria um novo usuário no db a partir do body da requisição.
+// Usa closure para capturar o db, evitando variáveis globais.
+func handlePostUsers(db map[int64]User) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Limita o tamanho do body a 1000 bytes para evitar payloads excessivamente grandes.
+		r.Body = http.MaxBytesReader(w, r.Body, 1000)
 
+		// Lê todo o conteúdo do body da requisição.
+		data, err := io.ReadAll(r.Body)
+
+		if err != nil {
+			// errors.As verifica se o erro é do tipo MaxBytesError (body excedeu o limite).
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+
+			// Para qualquer outro erro de leitura, loga no terminal e retorna 500.
+			fmt.Println(err)
+			http.Error(w, "something went wrong", http.StatusInternalServerError)
+			return
+		}
+
+		var user User
+
+		// Deserializa o JSON do body para o struct User.
+		// Retorna 422 se o JSON for inválido ou não corresponder aos campos esperados.
+		if err := json.Unmarshal(data, &user); err != nil {
+			http.Error(w, "invalid body", http.StatusUnprocessableEntity)
+			return
+		}
+
+		// Salva o usuário no map usando o ID como chave.
+		db[user.ID] = user
+
+		// Retorna 201 Created indicando que o recurso foi criado com sucesso.
+		w.WriteHeader(http.StatusCreated)
+	}
 }
