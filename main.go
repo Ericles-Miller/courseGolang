@@ -21,6 +21,26 @@ type User struct {
 	Password string `json:"-"`
 }
 
+type Response struct {
+	Error string `json:"error,omitempty"`
+	Data  any    `json:"data,omitempty"`
+}
+
+func sendJSON(w http.ResponseWriter, resp Response, status int) {
+	data, err := json.Marshal(resp)
+	if err != nil {
+		fmt.Println("error ao fazer marshal de json:", err)
+		sendJSON(w, Response{Error: "something went wrong"}, http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(status)
+	if _, err := w.Write(data); err != nil {
+		fmt.Println("error ao enviar a resposta:", err)
+		return
+	}
+}
+
 func main() {
 	// chi.NewMux cria o roteador principal onde rotas e middlewares são registrados.
 	r := chi.NewMux()
@@ -89,20 +109,11 @@ func handleGetUsers(db map[int64]User) http.HandlerFunc {
 
 		// Se o usuário não existir no map, retorna 404 com mensagem de erro em JSON.
 		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error": "usuario nao encontrado"}`))
+			sendJSON(w, Response{Error: "usuario nao encontrado"}, http.StatusNotFound)
 			return
 		}
 
-		// Serializa o struct User para JSON. Password é omitido pela tag `json:"-"`.
-		data, err := json.Marshal(user)
-
-		if err != nil {
-			http.Error(w, "something went wrong", http.StatusInternalServerError)
-			return
-		}
-
-		_, _ = w.Write(data)
+		sendJSON(w, Response{Data: user}, http.StatusOK)
 	}
 }
 
@@ -120,13 +131,13 @@ func handlePostUsers(db map[int64]User) http.HandlerFunc {
 			// errors.As verifica se o erro é do tipo MaxBytesError (body excedeu o limite).
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
-				http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+				sendJSON(w, Response{Error: "body too large"}, http.StatusRequestEntityTooLarge)
 				return
 			}
 
 			// Para qualquer outro erro de leitura, loga no terminal e retorna 500.
 			fmt.Println(err)
-			http.Error(w, "something went wrong", http.StatusInternalServerError)
+			sendJSON(w, Response{Error: "something went wrong"}, http.StatusInternalServerError)
 			return
 		}
 
@@ -135,7 +146,7 @@ func handlePostUsers(db map[int64]User) http.HandlerFunc {
 		// Deserializa o JSON do body para o struct User.
 		// Retorna 422 se o JSON for inválido ou não corresponder aos campos esperados.
 		if err := json.Unmarshal(data, &user); err != nil {
-			http.Error(w, "invalid body", http.StatusUnprocessableEntity)
+			sendJSON(w, Response{Error: "invalid body"}, http.StatusUnprocessableEntity)
 			return
 		}
 
