@@ -1,14 +1,21 @@
+// Package main é o ponto de entrada da aplicação: configura o logger estruturado
+// (zap + slog) e sobe um servidor HTTP com roteamento via chi.
 package main
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
-	"errors"
-	"fmt"
-	"io"
+	"os"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"context"
+	"time"
+	"go.uber.org/zap"
+	"go.uber.org/zap/exp/zapslog"
 )
 
 // User representa um usuário do sistema.
@@ -18,30 +25,121 @@ type User struct {
 	Username string
 	ID       int64 `json:",string"`
 	Role     string
-	Password string `json:"-"`
+	Password Password `json:"-"`
 }
 
+// Password é um tipo dedicado para senhas: impede que o valor apareça
+// acidentalmente em logs ou na saída fmt.
+type Password string
+
+// String implementa fmt.Stringer — qualquer %v ou %s mostrará "[REDACTED]"
+// em vez do valor real da senha.
+func (p Password) String() string {
+	return "[REDACTED]"
+}
+
+// LogValue implementa slog.LogValuer — garante que o slog também
+// registre "[REDACTED]" ao logar um campo do tipo Password.
+func (p Password) LogValue() slog.Value {
+	return slog.StringValue("[REDACTED]")
+}
+
+// LevelFoo é um nível de log customizado abaixo de DEBUG (-4),
+// usado para demonstrar como criar níveis arbitrários com slog.
+const LevelFoo = slog.Level(-50)
+
+// Response é o envelope padrão de todas as respostas JSON da API.
+// Apenas um dos campos (Error ou Data) deve estar preenchido por resposta.
 type Response struct {
 	Error string `json:"error,omitempty"`
 	Data  any    `json:"data,omitempty"`
 }
 
+// sendJSON serializa resp como JSON, define o status HTTP e escreve na resposta.
+// Em caso de falha no marshal, registra o erro e retorna 500 automaticamente.
 func sendJSON(w http.ResponseWriter, resp Response, status int) {
 	data, err := json.Marshal(resp)
 	if err != nil {
-		fmt.Println("error ao fazer marshal de json:", err)
+		slog.Error("error ao fazer marshal de json", "error", err)
 		sendJSON(w, Response{Error: "something went wrong"}, http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(status)
 	if _, err := w.Write(data); err != nil {
-		fmt.Println("error ao enviar a resposta:", err)
+		slog.Error("error ao enviar a resposta", "error", err)
 		return
 	}
 }
 
 func main() {
+	// zap.NewProduction cria um logger de alta performance com saida JSON
+	// pre-configurado para producao (nivel Info, sem cores, timestamps UTC).
+	z, err := zap.NewProduction()
+	if err != nil {
+		panic(err)
+	}
+
+	// zapslog.NewHandler adapta o core do zap para a interface slog.Handler,
+	// permitindo usar a API padrao slog com o backend de performance do zap.
+	zs := slog.New(zapslog.NewHandler(z.Core(), nil))
+	zs.Info("Uma mensagem de teste")
+
+	// Demonstracao do tipo Password: o valor nunca aparece em logs.
+	p := Password("123456")
+	u := User{Password: p}
+	slog.Info("password", "u", u)
+
+	// HandlerOptions configura o comportamento do handler JSON:
+	// - AddSource: inclui arquivo e linha de onde o log foi chamado.
+	// - Level: define o nivel minimo; LevelFoo (-50) aceita qualquer log.
+	// - ReplaceAttr: reescreve atributos antes de serializar — aqui troca
+	//   o label "DEBUG-46" pelo alias legivel "FOO".
+	opts := &slog.HandlerOptions{
+		AddSource: true,
+		Level:     LevelFoo,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == "level" {
+				level := a.Value.String()
+				if level == "DEBUG-46" {
+					a.Value = slog.StringValue("FOO")
+				}
+			}
+			return a
+		},
+	}
+
+	// NewJSONHandler escreve cada log como uma linha JSON no stdout.
+	l := slog.New(slog.NewJSONHandler(os.Stdout, opts))
+
+	// SetDefault substitui o logger global do pacote slog por l,
+	// fazendo slog.Info/Debug/etc. usarem este handler a partir daqui.
+	slog.SetDefault(l)
+	slog.Debug("foo")
+	slog.Info("Servico sendo iniciado", "version", "1.0.0")
+
+	// l.With adiciona campos fixos a todas as mensagens do logger derivado.
+	// slog.Group agrupa os campos sob uma chave comum no JSON ("app_info").
+	l = l.With(slog.Group("app_info", slog.String("version", "1.0.0.")))
+	l.Info("this is a test", "user", u)
+
+	// LogAttrs e mais eficiente que Info/Debug pois evita alocacoes extras
+	// ao aceitar slog.Attr diretamente em vez de pares chave/valor interface{}.
+	l.LogAttrs(context.Background(), LevelFoo, "qualquer mensagem")
+	l.LogAttrs(
+		context.Background(),
+		slog.LevelInfo,
+		"tivemos um http request",
+		// slog.Group agrupa campos relacionados sob uma chave no JSON,
+		// facilitando filtragem e leitura em ferramentas como Datadog/Loki.
+		slog.Group("http_data",
+			slog.String("method", http.MethodDelete),
+			slog.Int("status", http.StatusOK),
+		),
+		slog.Duration("time_taken", time.Second),
+		slog.String("user_agent", "ahsiduas"),
+	)
+
 	// chi.NewMux cria o roteador principal onde rotas e middlewares são registrados.
 	r := chi.NewMux()
 
@@ -128,15 +226,14 @@ func handlePostUsers(db map[int64]User) http.HandlerFunc {
 		data, err := io.ReadAll(r.Body)
 
 		if err != nil {
-			// errors.As verifica se o erro é do tipo MaxBytesError (body excedeu o limite).
-			var maxErr *http.MaxBytesError
-			if errors.As(err, &maxErr) {
+			// errors.AsType verifica se o erro é do tipo MaxBytesError (body excedeu o limite).
+			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 				sendJSON(w, Response{Error: "body too large"}, http.StatusRequestEntityTooLarge)
 				return
 			}
 
 			// Para qualquer outro erro de leitura, loga no terminal e retorna 500.
-			fmt.Println(err)
+			slog.Error("falha ao ler o json do usuario", "error", err)
 			sendJSON(w, Response{Error: "something went wrong"}, http.StatusInternalServerError)
 			return
 		}
